@@ -1,4 +1,4 @@
-# 📈 Forex Machine Learning Trading Pipeline v2.0
+# 📈 Forex Machine Learning Trading 
 
 ![Python Version](https://img.shields.io/badge/Python-3.12%2B-blue?style=for-the-badge&logo=python)
 ![Scikit-Learn](https://img.shields.io/badge/scikit--learn-1.6.1-orange?style=for-the-badge&logo=scikitlearn)
