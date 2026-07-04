@@ -155,48 +155,46 @@ def train_logistic_regression(
     return model, scaler, X_val_scaled, X_test_scaled
 
 
+class ManualEnsemble:
+    """Manual soft voting ensemble for pre-fitted estimators."""
+    def __init__(self, models, weights=None):
+        self.models = models
+        self.weights = weights or [1.0] * len(models)
+        self.classes_ = models[0].classes_ if hasattr(models[0], 'classes_') else np.array([-1, 0, 1])
+        # Aggregate feature importances (weighted average)
+        importances = []
+        for m, w in zip(models, self.weights):
+            if hasattr(m, 'feature_importances_'):
+                importances.append(m.feature_importances_ * w)
+        if importances:
+            self.feature_importances_ = np.mean(importances, axis=0)
+
+    def predict(self, X):
+        probas = self.predict_proba(X)
+        pred_indices = np.argmax(probas, axis=1)
+        return np.array([self.classes_[i] for i in pred_indices])
+
+    def predict_proba(self, X):
+        all_probas = []
+        for model, weight in zip(self.models, self.weights):
+            proba = model.predict_proba(X)
+            all_probas.append(proba * weight)
+        # Weighted average of probabilities
+        avg_proba = np.sum(all_probas, axis=0) / sum(self.weights)
+        return avg_proba
+
 def train_ensemble(
     rf_model: RandomForestClassifier,
     xgb_wrapped: XGBWrapper,
     X_train: pd.DataFrame,
     y_train: pd.Series,
-) -> VotingClassifier:
+):
     """
     NEW: Create an ensemble of Random Forest + XGBoost using soft voting.
     Soft voting = averages class probabilities from both models.
     This typically outperforms individual models by reducing variance.
     """
     logger.info("Training Ensemble (RF + XGBoost soft voting)...")
-
-    # We use a VotingClassifier with pre-fitted estimators
-    # The XGBWrapper already handles label mapping, but VotingClassifier
-    # needs sklearn-compatible estimators. We'll do a manual ensemble instead.
-    class ManualEnsemble:
-        def __init__(self, models, weights=None):
-            self.models = models
-            self.weights = weights or [1.0] * len(models)
-            self.classes_ = models[0].classes_ if hasattr(models[0], 'classes_') else np.array([-1, 0, 1])
-            # Aggregate feature importances (weighted average)
-            importances = []
-            for m, w in zip(models, self.weights):
-                if hasattr(m, 'feature_importances_'):
-                    importances.append(m.feature_importances_ * w)
-            if importances:
-                self.feature_importances_ = np.mean(importances, axis=0)
-
-        def predict(self, X):
-            probas = self.predict_proba(X)
-            pred_indices = np.argmax(probas, axis=1)
-            return np.array([self.classes_[i] for i in pred_indices])
-
-        def predict_proba(self, X):
-            all_probas = []
-            for model, weight in zip(self.models, self.weights):
-                proba = model.predict_proba(X)
-                all_probas.append(proba * weight)
-            # Weighted average of probabilities
-            avg_proba = np.sum(all_probas, axis=0) / sum(self.weights)
-            return avg_proba
 
     # Weight XGBoost slightly higher (usually better calibrated)
     ensemble = ManualEnsemble([rf_model, xgb_wrapped], weights=[0.4, 0.6])
