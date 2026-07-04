@@ -135,7 +135,7 @@ SL_PIPS = 20
 TP_PIPS = 40
 INITIAL_CAPITAL = 10_000
 MAX_POSITIONS = 1
-MIN_CONFIDENCE = 0.60
+MIN_CONFIDENCE = 0.40  # Lowered from 0.60 so the model actually takes trades
 MAX_DAILY_LOSS_PCT = 3.0
 LOT_SIZE = 10_000  # mini lot
 
