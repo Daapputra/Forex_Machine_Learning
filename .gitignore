@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files (these are too large for git and shouldn't be version controlled)
+data/*.csv
+!data/.gitkeep
+
+# Models and outputs
+models/*.pkl
+models/*.json
+outputs/*
+logs/*
+!outputs/.gitkeep
+!logs/.gitkeep
+!models/.gitkeep
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
