@@ -46,8 +46,20 @@ logger = logging.getLogger("Pipeline")
 
 def main():
     logger.info("=" * 70)
-    logger.info("FOREX ML PIPELINE v2.0 — PRODUCTION QUALITY")
+    logger.info("FOREX ML PIPELINE v2.0 -- PRODUCTION QUALITY")
     logger.info("=" * 70)
+
+    # ---------------------------------------------------------
+    # CLEANUP: Remove old models to prevent version mismatch
+    # ---------------------------------------------------------
+    import glob as _glob
+    old_models = _glob.glob(os.path.join(config.MODELS_DIR, "*.pkl")) + \
+                 _glob.glob(os.path.join(config.MODELS_DIR, "*.json"))
+    if old_models:
+        logger.info(f"Cleaning up {len(old_models)} old model files...")
+        for f in old_models:
+            os.remove(f)
+        logger.info("Old models removed. Fresh training will begin.")
 
     # ---------------------------------------------------------
     # PHASE 1: Data Preparation
