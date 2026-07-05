@@ -34,6 +34,11 @@ def generate_signal(latest_ohlcv: pd.DataFrame, pair: str = None, timeframe: str
     # 1. Clean data
     cleaned_df = data_cleaner.clean_data(latest_ohlcv.copy())
 
+    # 1.5 Add ATR for backtester/features (v3.0 requirement)
+    import labeler
+    if config.LABEL_MODE == "atr":
+        cleaned_df["atr_14"] = labeler.compute_atr_pips(cleaned_df) * config.PIP_SIZE
+
     # 2. Engineer features (drop_na=False: we only need the last row)
     feat_df = features.engineer_features(cleaned_df, drop_na=False)
 
@@ -47,11 +52,7 @@ def generate_signal(latest_ohlcv: pd.DataFrame, pair: str = None, timeframe: str
             "timestamp": str(latest_features.index[0]) if not latest_features.empty else None
         }
 
-    # Extract feature columns
-    X_cols = features.get_feature_columns(feat_df)
-    X = latest_features[X_cols]
-
-    # 3. Load best model
+    # 3. Load best model (need metadata to know which features to select)
     try:
         model, metadata = model_registry.load_best_model(pair, timeframe)
     except Exception as e:
@@ -60,6 +61,18 @@ def generate_signal(latest_ohlcv: pd.DataFrame, pair: str = None, timeframe: str
             "signal": "ERROR",
             "reason": f"Model load failed: {str(e)}"
         }
+
+    # Extract feature columns based on model metadata (v3.0 feature selection)
+    X_cols = metadata.get("feature_cols", features.get_feature_columns(feat_df))
+    # Ensure all required columns exist
+    missing_cols = [c for c in X_cols if c not in latest_features.columns]
+    if missing_cols:
+        return {
+            "signal": "ERROR",
+            "reason": f"Missing features required by model: {missing_cols}"
+        }
+        
+    X = latest_features[X_cols]
 
     # 4. Predict — all models now return original labels (-1, 0, 1)
     pred_label = model.predict(X)[0]
@@ -91,16 +104,25 @@ def generate_signal(latest_ohlcv: pd.DataFrame, pair: str = None, timeframe: str
             "model_version": metadata.get("version")
         }
 
-    # Calculate suggested SL/TP
+    # Calculate suggested dynamic SL/TP (v3.0)
     latest_close = float(latest_features.iloc[0]["close"])
     sl, tp = 0.0, 0.0
+    
+    current_atr = float(latest_features.iloc[0].get("atr_14", config.SL_PIPS * config.PIP_SIZE))
+    sl_distance = current_atr * config.SL_ATR_MULT
+    tp_distance = current_atr * config.TP_ATR_MULT
+    
+    # Enforce minimums
+    min_dist = 5 * config.PIP_SIZE
+    sl_distance = max(sl_distance, min_dist)
+    tp_distance = max(tp_distance, min_dist * 1.5)
 
     if signal_str == "BUY":
-        sl = latest_close - (config.SL_PIPS * config.PIP_SIZE)
-        tp = latest_close + (config.TP_PIPS * config.PIP_SIZE)
+        sl = latest_close - sl_distance
+        tp = latest_close + tp_distance
     elif signal_str == "SELL":
-        sl = latest_close + (config.SL_PIPS * config.PIP_SIZE)
-        tp = latest_close - (config.TP_PIPS * config.PIP_SIZE)
+        sl = latest_close + sl_distance
+        tp = latest_close - tp_distance
 
     return {
         "signal": signal_str,
