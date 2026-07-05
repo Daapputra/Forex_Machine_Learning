@@ -63,7 +63,7 @@ def generate_signal(latest_ohlcv: pd.DataFrame, pair: str = None, timeframe: str
         }
 
     # Extract feature columns based on model metadata (v3.0 feature selection)
-    X_cols = metadata.get("feature_cols", features.get_feature_columns(feat_df))
+    X_cols = metadata.get("features", features.get_feature_columns(feat_df))
     # Ensure all required columns exist
     missing_cols = [c for c in X_cols if c not in latest_features.columns]
     if missing_cols:
