@@ -1,7 +1,8 @@
 """
-config.py — Centralized Configuration for Forex ML Pipeline (v2.0)
+config.py — Centralized Configuration for Forex ML Pipeline (v3.0)
 ====================================================================
-UPGRADED for 5-year dataset (2021-2025) + production-quality modeling.
+UPGRADED v3.0: Dynamic ATR-based labeling & SL/TP, feature selection,
+optimized for profitable backtesting and paper-quality results.
 All tunable parameters live here. No magic numbers in other modules.
 """
 
@@ -16,8 +17,6 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
 
-# Source data directory (Pipeline reads ALL .csv files inside this folder)
-
 # ──────────────────────────────────────────────────────────────
 # Instrument & Timeframe
 # ──────────────────────────────────────────────────────────────
@@ -30,11 +29,20 @@ SOURCE_TZ = "US/Eastern"
 TARGET_TZ = "UTC"
 
 # ──────────────────────────────────────────────────────────────
-# Labeling Thresholds (in pips)
+# Labeling — v3.0: DYNAMIC ATR-based (adapts to market volatility)
 # ──────────────────────────────────────────────────────────────
+LABEL_MODE = "atr"   # "fixed" = old style, "atr" = dynamic v3.0
+
+# Fixed thresholds (used only if LABEL_MODE == "fixed")
 LABEL_BUY_THRESHOLD = 10    # pip_return > 10 -> BUY (1)
 LABEL_SELL_THRESHOLD = -10  # pip_return < -10 -> SELL (-1)
-# Otherwise -> HOLD (0)
+
+# ATR-based thresholds (used if LABEL_MODE == "atr")
+LABEL_ATR_PERIOD = 14       # ATR lookback period for labeling
+LABEL_ATR_MULTIPLIER = 0.7  # threshold = ATR * multiplier
+# Example: if ATR=12 pips, threshold = 12*0.7 = 8.4 pips
+# This creates MORE BUY/SELL labels in volatile markets,
+# and FEWER in calm markets — exactly what we want.
 
 # ──────────────────────────────────────────────────────────────
 # Feature Engineering
@@ -69,6 +77,12 @@ SESSION_LONDON = (8, 16)
 SESSION_NY = (13, 21)
 
 # ──────────────────────────────────────────────────────────────
+# Feature Selection — v3.0: Keep only top-N features
+# ──────────────────────────────────────────────────────────────
+FEATURE_SELECTION_ENABLED = True
+FEATURE_SELECTION_TOP_N = 25  # Keep top 25 most important features
+
+# ──────────────────────────────────────────────────────────────
 # Data Cleaning
 # ──────────────────────────────────────────────────────────────
 MAX_FFILL_CANDLES = 3
@@ -84,12 +98,12 @@ TEST_RATIO = 0.15
 # Model Hyperparameters — TUNED for 5-year dataset
 # ──────────────────────────────────────────────────────────────
 
-# Random Forest — beefier for larger dataset
+# Random Forest
 RF_PARAMS = {
     "n_estimators": 500,
-    "max_depth": 15,
-    "min_samples_split": 20,
-    "min_samples_leaf": 10,
+    "max_depth": 12,          # v3.0: slightly shallower to reduce overfitting
+    "min_samples_split": 30,  # v3.0: increased
+    "min_samples_leaf": 15,   # v3.0: increased
     "max_features": "sqrt",
     "class_weight": "balanced",
     "random_state": 42,
@@ -98,24 +112,24 @@ RF_PARAMS = {
 
 # XGBoost — tuned with regularization to prevent overfitting
 XGB_PARAMS = {
-    "max_depth": 8,
-    "learning_rate": 0.05,        # slower learning for better generalization
-    "n_estimators": 1000,         # more trees (early stopping will pick best)
-    "min_child_weight": 10,       # prevent splits on tiny samples
-    "subsample": 0.8,             # row subsampling (bagging)
-    "colsample_bytree": 0.8,     # column subsampling per tree
-    "gamma": 1,                   # min loss reduction to make split
-    "reg_alpha": 0.1,            # L1 regularization
-    "reg_lambda": 1.0,           # L2 regularization
+    "max_depth": 6,              # v3.0: reduced from 8
+    "learning_rate": 0.03,       # v3.0: slower learning
+    "n_estimators": 1500,        # v3.0: more trees (early stopping picks best)
+    "min_child_weight": 15,      # v3.0: increased
+    "subsample": 0.7,            # v3.0: more row subsampling
+    "colsample_bytree": 0.7,     # v3.0: more column subsampling
+    "gamma": 2,                  # v3.0: stronger min loss requirement
+    "reg_alpha": 0.5,            # v3.0: stronger L1
+    "reg_lambda": 2.0,           # v3.0: stronger L2
     "objective": "multi:softprob",
     "num_class": 3,
     "eval_metric": "mlogloss",
     "use_label_encoder": False,
     "random_state": 42,
     "verbosity": 0,
-    "tree_method": "hist",       # faster for large datasets
+    "tree_method": "hist",
 }
-XGB_EARLY_STOPPING = 50  # more patience for larger dataset
+XGB_EARLY_STOPPING = 50
 
 # Logistic Regression baseline
 LR_PARAMS = {
@@ -123,26 +137,34 @@ LR_PARAMS = {
     "class_weight": "balanced",
     "random_state": 42,
     "solver": "lbfgs",
-    "C": 0.1,                    # stronger regularization
+    "C": 0.1,
 }
 
 # ──────────────────────────────────────────────────────────────
-# Backtesting
+# Backtesting — v3.0: DYNAMIC ATR-based SL/TP
 # ──────────────────────────────────────────────────────────────
 SPREAD_PIPS = 2.0
 SLIPPAGE_PIPS = 0.5
+
+# Dynamic SL/TP (v3.0): SL = ATR * SL_ATR_MULT, TP = ATR * TP_ATR_MULT
+SL_ATR_MULT = 1.5   # SL = 1.5x ATR (tight enough to limit loss)
+TP_ATR_MULT = 2.0   # TP = 2.0x ATR (gives room to profit)
+# Risk:Reward = 1:1.33 — with a decent model, this is profitable
+
+# Fallback fixed SL/TP (used only if ATR not available)
 SL_PIPS = 20
 TP_PIPS = 40
+
 INITIAL_CAPITAL = 10_000
 MAX_POSITIONS = 1
-MIN_CONFIDENCE = 0.40  # Lowered from 0.60 so the model actually takes trades
+MIN_CONFIDENCE = 0.38   # v3.0: calibrated lower for more trades
 MAX_DAILY_LOSS_PCT = 3.0
 LOT_SIZE = 10_000  # mini lot
 
 # ──────────────────────────────────────────────────────────────
 # Model Registry / Versioning
 # ──────────────────────────────────────────────────────────────
-MODEL_VERSION = "v2.0.0"
+MODEL_VERSION = "v3.0.0"
 
 # ──────────────────────────────────────────────────────────────
 # Monitoring

@@ -1,16 +1,18 @@
 """
-trainer.py — Model Training (v2.0)
+trainer.py — Model Training (v3.0)
 =====================================
-UPGRADED for 5-year dataset:
-  1. Random Forest (tuned)
+v3.0 UPGRADE:
+  1. Random Forest (tuned, stronger regularization)
   2. XGBoost (tuned with regularization + early stopping)
   3. Logistic Regression baseline (with StandardScaler)
   4. Rule-based baseline (RSI)
-  5. NEW: Ensemble Voting Classifier (RF + XGBoost combined)
+  5. Ensemble Voting Classifier (RF + XGBoost combined)
+  6. NEW: Feature Selection (top-N features based on RF importance)
 
 ANTI-LEAKAGE:
   - StandardScaler is fit ONLY on training data, then applied to val/test.
   - XGBoost uses validation set for early stopping (no test leakage).
+  - Feature selection is determined ONLY from training data.
 """
 
 import numpy as np
@@ -34,7 +36,6 @@ class XGBWrapper:
     Wrapper for XGBoost to handle label mapping transparently.
     Maps original labels (-1, 0, 1) to 0-indexed (0, 1, 2) internally,
     but exposes predict/predict_proba with original labels.
-    This makes it compatible with VotingClassifier.
     """
     def __init__(self, xgb_model, label_map, label_map_inv):
         self.xgb_model = xgb_model
@@ -48,111 +49,7 @@ class XGBWrapper:
         return np.array([self.label_map_inv[p] for p in raw_pred])
 
     def predict_proba(self, X):
-        # XGBoost returns probabilities in 0-indexed order (SELL, HOLD, BUY)
-        # which maps to original order (-1, 0, 1) — same order, so no reorder needed
         return self.xgb_model.predict_proba(X)
-
-
-def train_random_forest(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    params: dict = None,
-) -> RandomForestClassifier:
-    """Train Random Forest with balanced class weights."""
-    params = params or config.RF_PARAMS
-
-    logger.info(f"Training Random Forest: {params}")
-
-    model = RandomForestClassifier(**params)
-    model.fit(X_train, y_train)
-
-    train_acc = model.score(X_train, y_train)
-    logger.info(f"RF Train accuracy: {train_acc:.4f}")
-
-    return model
-
-
-def train_xgboost(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-    params: dict = None,
-    early_stopping: int = None,
-) -> XGBWrapper:
-    """
-    Train XGBoost with early stopping. Returns wrapped model that handles
-    label mapping transparently.
-    """
-    params = params or config.XGB_PARAMS.copy()
-    early_stopping = early_stopping or config.XGB_EARLY_STOPPING
-
-    # Map labels to 0-indexed for XGBoost
-    y_train_mapped = y_train.map(config.LABEL_MAP)
-    y_val_mapped = y_val.map(config.LABEL_MAP)
-
-    logger.info(f"Training XGBoost: {params}")
-    logger.info(f"Early stopping: {early_stopping} rounds on validation set")
-
-    model = XGBClassifier(**params, early_stopping_rounds=early_stopping)
-    model.fit(
-        X_train, y_train_mapped,
-        eval_set=[(X_val, y_val_mapped)],
-        verbose=False,
-    )
-
-    best_iteration = model.best_iteration if hasattr(model, 'best_iteration') else "N/A"
-    logger.info(f"XGBoost best iteration: {best_iteration}")
-
-    # Wrap for transparent label mapping
-    wrapped = XGBWrapper(model, config.LABEL_MAP, config.LABEL_MAP_INV)
-    return wrapped
-
-
-def train_logistic_regression(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame = None,
-    X_test: pd.DataFrame = None,
-    params: dict = None,
-) -> Tuple[LogisticRegression, StandardScaler, pd.DataFrame, pd.DataFrame]:
-    """
-    Train Logistic Regression baseline with StandardScaler.
-    ANTI-LEAKAGE: Scaler is fit ONLY on X_train.
-    """
-    params = params or config.LR_PARAMS
-
-    logger.info(f"Training Logistic Regression baseline: {params}")
-
-    scaler = StandardScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index,
-    )
-
-    X_val_scaled = None
-    X_test_scaled = None
-    if X_val is not None:
-        X_val_scaled = pd.DataFrame(
-            scaler.transform(X_val),
-            columns=X_val.columns,
-            index=X_val.index,
-        )
-    if X_test is not None:
-        X_test_scaled = pd.DataFrame(
-            scaler.transform(X_test),
-            columns=X_test.columns,
-            index=X_test.index,
-        )
-
-    model = LogisticRegression(**params)
-    model.fit(X_train_scaled, y_train)
-
-    train_acc = model.score(X_train_scaled, y_train)
-    logger.info(f"LR Train accuracy: {train_acc:.4f}")
-
-    return model, scaler, X_val_scaled, X_test_scaled
 
 
 class ManualEnsemble:
@@ -179,9 +76,123 @@ class ManualEnsemble:
         for model, weight in zip(self.models, self.weights):
             proba = model.predict_proba(X)
             all_probas.append(proba * weight)
-        # Weighted average of probabilities
         avg_proba = np.sum(all_probas, axis=0) / sum(self.weights)
         return avg_proba
+
+
+def select_top_features(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    top_n: int = None,
+) -> list:
+    """
+    v3.0: Feature Selection using a quick Random Forest to rank importance.
+    Trained ONLY on training data to prevent leakage.
+    Returns list of top-N feature column names.
+    """
+    top_n = top_n or config.FEATURE_SELECTION_TOP_N
+
+    logger.info(f"Running feature selection (selecting top {top_n} from {len(X_train.columns)})...")
+
+    # Train a quick RF for feature importance ranking
+    quick_rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    )
+    quick_rf.fit(X_train, y_train)
+
+    # Rank features by importance
+    importances = pd.Series(quick_rf.feature_importances_, index=X_train.columns)
+    importances = importances.sort_values(ascending=False)
+
+    selected = importances.head(top_n).index.tolist()
+
+    logger.info(f"Selected features: {selected}")
+    logger.info(f"Dropped features: {[f for f in X_train.columns if f not in selected]}")
+
+    return selected
+
+
+def train_random_forest(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    params: dict = None,
+) -> RandomForestClassifier:
+    """Train Random Forest classifier."""
+    params = params or config.RF_PARAMS
+    logger.info(f"Training Random Forest: {params}")
+
+    model = RandomForestClassifier(**params)
+    model.fit(X_train, y_train)
+
+    train_acc = model.score(X_train, y_train)
+    logger.info(f"RF Train accuracy: {train_acc:.4f}")
+
+    return model
+
+
+def train_xgboost(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    params: dict = None,
+) -> XGBWrapper:
+    """Train XGBoost with early stopping, wrapped for label transparency."""
+    params = params or config.XGB_PARAMS
+    logger.info(f"Training XGBoost: {params}")
+    logger.info(f"Early stopping: {config.XGB_EARLY_STOPPING} rounds on validation set")
+
+    # Map labels to 0-indexed for XGBoost
+    y_train_mapped = y_train.map(config.LABEL_MAP)
+    y_val_mapped = y_val.map(config.LABEL_MAP)
+
+    xgb_model = XGBClassifier(**params)
+    xgb_model.fit(
+        X_train, y_train_mapped,
+        eval_set=[(X_val, y_val_mapped)],
+        verbose=False,
+    )
+
+    best_iter = xgb_model.best_iteration if hasattr(xgb_model, 'best_iteration') else "N/A"
+    logger.info(f"XGBoost best iteration: {best_iter}")
+
+    # Wrap for label transparency
+    wrapped = XGBWrapper(xgb_model, config.LABEL_MAP, config.LABEL_MAP_INV)
+    return wrapped
+
+
+def train_logistic_regression(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    params: dict = None,
+) -> Tuple:
+    """Train LR baseline with StandardScaler (fit on train only)."""
+    params = params or config.LR_PARAMS
+    logger.info(f"Training Logistic Regression baseline: {params}")
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    X_test_scaled = scaler.transform(X_test)
+
+    model = LogisticRegression(**params)
+    model.fit(X_train_scaled, y_train)
+
+    train_acc = model.score(X_train_scaled, y_train)
+    logger.info(f"LR Train accuracy: {train_acc:.4f}")
+
+    # Convert back to DataFrames with index
+    X_val_scaled = pd.DataFrame(X_val_scaled, index=X_val.index, columns=X_val.columns)
+    X_test_scaled = pd.DataFrame(X_test_scaled, index=X_test.index, columns=X_test.columns)
+
+    return model, scaler, X_val_scaled, X_test_scaled
+
 
 def train_ensemble(
     rf_model: RandomForestClassifier,
@@ -190,9 +201,7 @@ def train_ensemble(
     y_train: pd.Series,
 ):
     """
-    NEW: Create an ensemble of Random Forest + XGBoost using soft voting.
-    Soft voting = averages class probabilities from both models.
-    This typically outperforms individual models by reducing variance.
+    Create ensemble of Random Forest + XGBoost using soft voting.
     """
     logger.info("Training Ensemble (RF + XGBoost soft voting)...")
 
@@ -237,10 +246,21 @@ def train_all_models(
     y_test: pd.Series,
     feature_cols: list,
     train_period: str = "",
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], list]:
     """
-    Train all models including the new ensemble.
+    Train all models. v3.0: returns (results_dict, selected_feature_cols).
+    Feature selection is performed BEFORE training if enabled.
     """
+    # ── v3.0: Feature Selection ──────────────────────────────
+    selected_cols = feature_cols
+    if config.FEATURE_SELECTION_ENABLED:
+        selected_cols = select_top_features(X_train, y_train)
+        X_train = X_train[selected_cols]
+        X_val = X_val[selected_cols]
+        X_test = X_test[selected_cols]
+        logger.info(f"Training with {len(selected_cols)} selected features (from {len(feature_cols)} total)")
+    # ─────────────────────────────────────────────────────────
+
     results = {}
 
     # 1. Random Forest
@@ -264,7 +284,7 @@ def train_all_models(
         "scaler": None,
         "X_val": X_val,
         "X_test": X_test,
-        "is_xgboost": False,  # Wrapper handles mapping now
+        "is_xgboost": False,
     }
 
     # 3. Ensemble (RF + XGBoost)
@@ -296,4 +316,4 @@ def train_all_models(
     logger.info("=" * 60)
     logger.info("All models trained successfully.")
 
-    return results
+    return results, selected_cols

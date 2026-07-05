@@ -1,14 +1,19 @@
 """
-run_pipeline.py — Orchestrator for Forex ML Pipeline (v2.0)
+run_pipeline.py — Orchestrator for Forex ML Pipeline (v3.0)
 =============================================================
-UPGRADED: Handles 5-year multi-file dataset, ensemble model,
-feature selection, and comprehensive backtesting.
+v3.0 UPGRADE:
+- Dynamic ATR-based labeling
+- Feature selection (top-N)
+- Dynamic ATR-based SL/TP in backtesting
+- Stronger regularization
+- Enhanced reporting
 """
 
 import os
 import sys
 import logging
 import warnings
+import glob as _glob
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -46,13 +51,12 @@ logger = logging.getLogger("Pipeline")
 
 def main():
     logger.info("=" * 70)
-    logger.info("FOREX ML PIPELINE v2.0 -- PRODUCTION QUALITY")
+    logger.info("FOREX ML PIPELINE v3.0 -- PRODUCTION QUALITY")
     logger.info("=" * 70)
 
     # ---------------------------------------------------------
     # CLEANUP: Remove old models to prevent version mismatch
     # ---------------------------------------------------------
-    import glob as _glob
     old_models = _glob.glob(os.path.join(config.MODELS_DIR, "*.pkl")) + \
                  _glob.glob(os.path.join(config.MODELS_DIR, "*.json"))
     if old_models:
@@ -66,17 +70,17 @@ def main():
     # ---------------------------------------------------------
     logger.info("\n--- PHASE 1: Data Preparation ---")
 
-    # 1. Load and resample (M1 -> H1) — now reads ALL CSVs in data/
+    # 1. Load and resample (M1 -> H1)
     df_raw = data_loader.load_data()
     logger.info(f"Total H1 candles after resample: {len(df_raw)}")
 
     # 2. Clean
     df_clean = data_cleaner.clean_data(df_raw)
 
-    # 3. Label (pip-returns, BEFORE feature engineering to avoid leakage)
+    # 3. Label (v3.0: dynamic ATR-based labeling)
     df_labeled = labeler.label_data(df_clean)
 
-    # 4. Engineer features (v2.0: ~45 features, all shifted)
+    # 4. Engineer features (v2.0: ~49 features, all shifted)
     df_features = features.engineer_features(df_labeled)
     logger.info(f"Final dataset size: {len(df_features)} rows")
 
@@ -90,17 +94,21 @@ def main():
     logger.info(f"Training period: {train_period}")
 
     # ---------------------------------------------------------
-    # PHASE 2: Modeling
+    # PHASE 2: Modeling (v3.0: with feature selection)
     # ---------------------------------------------------------
     logger.info("\n--- PHASE 2: Modeling ---")
 
     # Train RF, XGB, Ensemble, LR Baseline
-    trained_models = trainer.train_all_models(
+    # v3.0: train_all_models now returns (results, selected_feature_cols)
+    trained_models, selected_cols = trainer.train_all_models(
         X_train, y_train, X_val, y_val, X_test, y_test, feature_cols, train_period
     )
 
+    # Update X sets to use selected features for evaluation
+    X_val_selected = X_val[selected_cols]
+    X_test_selected = X_test[selected_cols]
+
     # Generate Rule-based baseline predictions for Val and Test
-    # Need to use df_features (which has RSI_14 column) for rule-based
     val_df = df_features.iloc[
         int(len(df_features) * config.TRAIN_RATIO):
         int(len(df_features) * (config.TRAIN_RATIO + config.VAL_RATIO))
@@ -109,12 +117,12 @@ def main():
         int(len(df_features) * (config.TRAIN_RATIO + config.VAL_RATIO)):
     ]
 
-    rule_based_val_pred = trainer.generate_rule_based_predictions(val_df, feature_cols)
-    rule_based_test_pred = trainer.generate_rule_based_predictions(test_df, feature_cols)
+    rule_based_val_pred = trainer.generate_rule_based_predictions(val_df, selected_cols)
+    rule_based_test_pred = trainer.generate_rule_based_predictions(test_df, selected_cols)
 
     # Evaluate all models
     all_results = evaluator.evaluate_all_models(
-        trained_models, y_val, y_test, feature_cols,
+        trained_models, y_val, y_test, selected_cols,
         rule_based_val_pred, rule_based_test_pred
     )
 
@@ -126,7 +134,7 @@ def main():
             model_registry.save_model(
                 model=info["model"],
                 model_type=model_name,
-                feature_cols=feature_cols,
+                feature_cols=selected_cols,
                 val_metrics=all_results[model_name]["val_metrics"],
                 train_period=train_period
             )
@@ -145,25 +153,27 @@ def main():
     logger.info(f"\nBEST MODEL: {best_model_name} (Test F1 Macro: {best_f1:.4f})")
 
     # ---------------------------------------------------------
-    # PHASE 3: Validation (Backtesting)
+    # PHASE 3: Validation (Backtesting with dynamic ATR SL/TP)
     # ---------------------------------------------------------
-    logger.info("\n--- PHASE 3: Validation (Backtesting) ---")
+    logger.info("\n--- PHASE 3: Validation (Backtesting v3.0 - Dynamic ATR SL/TP) ---")
 
     # Reconstruct raw df for test period
     df_test_raw = df_labeled.loc[X_test.index]
 
     # Backtest best model
     best_model = trained_models[best_model_name]["model"]
+    best_X_test = trained_models[best_model_name]["X_test"]
     eq_df, trades_df, bt_metrics = backtester.execute_backtest(
-        best_model, best_model_name, X_test, y_test, df_test_raw
+        best_model, best_model_name, best_X_test, y_test, df_test_raw
     )
 
     # Also backtest other ML models for comparison
     for model_name in ["random_forest", "xgboost", "ensemble"]:
-        if model_name != best_model_name:
+        if model_name != best_model_name and model_name in trained_models:
+            model_X_test = trained_models[model_name]["X_test"]
             backtester.execute_backtest(
                 trained_models[model_name]["model"],
-                model_name, X_test, y_test, df_test_raw
+                model_name, model_X_test, y_test, df_test_raw
             )
 
     # ---------------------------------------------------------
@@ -178,7 +188,7 @@ def main():
     # Demonstration: Signal Engine & Monitoring
     # ---------------------------------------------------------
     logger.info("\n--- Demonstration: Live Signal Generation ---")
-    simulated_live_data = df_raw.iloc[-200:]  # More history for indicators
+    simulated_live_data = df_raw.iloc[-200:]
 
     signal = signal_engine.generate_signal(simulated_live_data)
     logger.info(f"Generated Live Signal:\n{signal}")
@@ -189,16 +199,21 @@ def main():
     # Final Summary
     # ---------------------------------------------------------
     logger.info("\n" + "=" * 70)
-    logger.info("PIPELINE COMPLETED SUCCESSFULLY")
+    logger.info("PIPELINE v3.0 COMPLETED SUCCESSFULLY")
     logger.info("=" * 70)
     logger.info(f"Dataset: {len(df_features)} H1 candles")
-    logger.info(f"Features: {len(feature_cols)}")
+    logger.info(f"Features: {len(feature_cols)} total -> {len(selected_cols)} selected")
+    logger.info(f"Labeling: {config.LABEL_MODE} mode (ATR mult: {config.LABEL_ATR_MULTIPLIER})")
     logger.info(f"Best Model: {best_model_name} (F1 Macro: {best_f1:.4f})")
     logger.info(f"Backtest Trades: {bt_metrics.get('Total Trades', 0)}")
     logger.info(f"Backtest Return: {bt_metrics.get('Total Return (%)', 0):.2f}%")
     logger.info(f"Max Drawdown: {bt_metrics.get('Max Drawdown (%)', 0):.2f}%")
     logger.info(f"Sharpe Ratio: {bt_metrics.get('Sharpe Ratio', 0):.2f}")
     logger.info(f"Win Rate: {bt_metrics.get('Win Rate (%)', 0):.1f}%")
+    logger.info(f"Profit Factor: {bt_metrics.get('Profit Factor', 0):.2f}")
+    logger.info(f"Avg Win: {bt_metrics.get('Avg Win (pips)', 0):.1f} pips")
+    logger.info(f"Avg Loss: {bt_metrics.get('Avg Loss (pips)', 0):.1f} pips")
+    logger.info(f"SL/TP Mode: Dynamic ATR (SL={config.SL_ATR_MULT}x, TP={config.TP_ATR_MULT}x)")
     logger.info("=" * 70)
     logger.info(f"Models saved to: {config.MODELS_DIR}")
     logger.info(f"Charts saved to: {config.OUTPUTS_DIR}")
