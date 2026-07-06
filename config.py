@@ -157,8 +157,11 @@ TP_PIPS = 40
 
 INITIAL_CAPITAL = 10_000
 MAX_POSITIONS = 1
-MIN_CONFIDENCE = 0.45   # v4.0: Realistic for 3-class (higher than v3's 0.38)
-MIN_ADX_TREND = 15.0    # v4.0: Regime filter (mild: ADX > 15 = slight trend)
+
+# v4.1 (Fix Leakage): Thresholds are now tuned via Grid Search on Train/Val, NOT hardcoded.
+CONFIDENCE_GRID = [0.35, 0.40, 0.45, 0.50]
+ADX_GRID = [10.0, 15.0, 20.0]
+
 MAX_DAILY_LOSS_PCT = 3.0
 LOT_SIZE = 10_000  # mini lot
 

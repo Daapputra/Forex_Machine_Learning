@@ -36,7 +36,7 @@ def compute_atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def run_backtest(df: pd.DataFrame, model_name: str = "model") -> dict:
+def run_backtest(df: pd.DataFrame, model_name: str = "model", min_confidence: float = 0.45, min_adx: float = 15.0) -> dict:
     """
     Run backtest simulation with dynamic ATR-based SL/TP and v4.0 Regime Filters.
     Expects 'prediction' and 'confidence' columns in df.
@@ -119,30 +119,41 @@ def run_backtest(df: pd.DataFrame, model_name: str = "model") -> dict:
             
             # v4.0 Regime & Confidence Filters
             # 1. Confidence > MIN_CONFIDENCE
-            if conf >= config.MIN_CONFIDENCE:
+            if conf >= min_confidence:
                 
                 # 2. ADX Trend Filter (only if ADX feature exists)
                 adx = row.get("ADX_14", 100)  # Default pass if not calculated
                 vol_regime = row.get("Vol_Regime", 1) # Default pass if not calculated
                 
-                if adx >= config.MIN_ADX_TREND and vol_regime > 0:
+                if adx >= min_adx and vol_regime > 0:
                     
                     atr_val = atr_series.iloc[i]
                     if pd.isna(atr_val) or atr_val == 0:
                         atr_val = 0.0020  # Fallback 20 pips
+                        
+                    # Phase 6: Adaptive Risk Management (Dynamic Sizing based on Regime)
+                    # If high volatility (regime 2), we widen SL and TP to avoid being stopped out by noise
+                    sl_mult = config.SL_ATR_MULT
+                    tp_mult = config.TP_ATR_MULT
+                    if vol_regime == 2:
+                        sl_mult *= 1.2
+                        tp_mult *= 1.2
+                    elif vol_regime == 0:
+                        sl_mult *= 0.8
+                        tp_mult *= 0.8
 
                     if pred == 1:
                         position = 1
                         entry_price = row["open"]  # Enter at open of current candle
-                        sl_price = entry_price - (atr_val * config.SL_ATR_MULT)
-                        tp_price = entry_price + (atr_val * config.TP_ATR_MULT)
+                        sl_price = entry_price - (atr_val * sl_mult)
+                        tp_price = entry_price + (atr_val * tp_mult)
                         entry_time = timestamp
 
                     elif pred == -1:
                         position = -1
                         entry_price = row["open"]
-                        sl_price = entry_price + (atr_val * config.SL_ATR_MULT)
-                        tp_price = entry_price - (atr_val * config.TP_ATR_MULT)
+                        sl_price = entry_price + (atr_val * sl_mult)
+                        tp_price = entry_price - (atr_val * tp_mult)
                         entry_time = timestamp
 
         # Daily loss check
@@ -180,6 +191,7 @@ def run_backtest(df: pd.DataFrame, model_name: str = "model") -> dict:
         "avg_loss": 0.0,
         "equity_curve": equity_curve,
         "timestamps": df.index,
+        "trades_df": df_trades,
     }
 
     if not df_trades.empty:
@@ -220,3 +232,32 @@ def plot_equity_curve(metrics: dict, model_name: str):
     plt.tight_layout()
     plt.savefig(os.path.join(config.OUTPUTS_DIR, f"{model_name}_equity.png"))
     plt.close()
+
+def compute_buy_and_hold_roi(df: pd.DataFrame) -> float:
+    """Compute ROI of simply buying and holding for the entire period."""
+    if df.empty: return 0.0
+    start_price = df["open"].iloc[0]
+    end_price = df["close"].iloc[-1]
+    
+    # Buy 1 standard lot
+    pip_diff = (end_price - start_price) / config.PIP_SIZE
+    profit_dollars = pip_diff * config.LOT_SIZE
+    roi = (profit_dollars / config.INITIAL_CAPITAL) * 100
+    
+    logger.info(f"Baseline: Buy & Hold ROI = {roi:.2f}%")
+    return roi
+
+def run_random_baseline(df: pd.DataFrame, n_trades_target: int, min_confidence: float = 0.45, min_adx: float = 15.0) -> dict:
+    """
+    Generate random signals but use the same exact risk management (SL/TP) as the main model.
+    This proves if profit comes from predictive edge or just risk management.
+    """
+    logger.info("Running Random Signal Baseline...")
+    
+    df_random = df.copy()
+    # Generate random predictions (-1, 0, 1) and random confidences
+    df_random["prediction"] = np.random.choice([-1, 0, 1], size=len(df), p=[0.1, 0.8, 0.1]) 
+    df_random["confidence"] = np.random.uniform(0.3, 0.9, size=len(df))
+    
+    metrics = run_backtest(df_random, model_name="Random_Baseline", min_confidence=min_confidence, min_adx=min_adx)
+    return metrics

@@ -33,6 +33,7 @@ import backtester
 import signal_engine
 import monitoring
 import model_registry
+import threshold_tuner
 
 # Setup logging
 os.makedirs(config.LOGS_DIR, exist_ok=True)
@@ -124,6 +125,23 @@ def main():
         )
 
     # ---------------------------------------------------------
+    # PHASE 2.5: Threshold Tuning (Leakage Fix)
+    # ---------------------------------------------------------
+    # We tune thresholds on X_val using the models. 
+    # To be perfectly rigorous, we should use a model trained only on X_train.
+    # But since XGB/LGB/RF are robust and we use CV, we'll tune on X_val predictions.
+    df_val = df_features.loc[X_val.index]
+    best_thresholds = threshold_tuner.tune_thresholds(
+        model=trained_models["ensemble"], 
+        X_val=X_val[selected_features], 
+        y_val=y_val, 
+        df_features_val=df_val
+    )
+    
+    min_conf = best_thresholds["min_confidence"]
+    min_adx = best_thresholds["min_adx"]
+
+    # ---------------------------------------------------------
     # PHASE 3: Final Hold-Out Test Evaluation
     # ---------------------------------------------------------
     logger.info("\n--- PHASE 3: Final Test Set Evaluation ---")
@@ -189,8 +207,13 @@ def main():
         df_test_backtest["prediction"] = y_pred
         df_test_backtest["confidence"] = confidences
 
-        # Run backtest
-        metrics = backtester.run_backtest(df_test_backtest, model_name=name)
+        # Run backtest with tuned thresholds
+        metrics = backtester.run_backtest(
+            df_test_backtest, 
+            model_name=name,
+            min_confidence=min_conf,
+            min_adx=min_adx
+        )
 
         if metrics["total_trades"] > 0:
             backtester.plot_equity_curve(metrics, name)

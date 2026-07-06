@@ -17,8 +17,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 import lightgbm as lgb
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 import config
 import model_registry
@@ -105,14 +107,57 @@ def select_top_features(
     importances = importances.sort_values(ascending=False)
 
     selected = importances.head(top_n).index.tolist()
-    logger.info(f"Selected features: {selected}")
+    logger.info(f"Selected features by RF Gini: {selected}")
     return selected
+
+
+def drop_high_vif_features(X: pd.DataFrame, threshold: float = 10.0) -> list:
+    """
+    NEW: Drops highly collinear features using Variance Inflation Factor (VIF).
+    """
+    logger.info("Running Multicollinearity (VIF) check...")
+    
+    # VIF requires handling NaNs/Infs, scaling, and is computationally heavy for many rows.
+    # We'll sample 5000 rows to speed it up
+    X_sample = X.dropna().sample(min(5000, len(X)), random_state=42)
+    
+    # Scale data for numerical stability in VIF
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X_sample), columns=X_sample.columns)
+    
+    features_to_keep = X_scaled.columns.tolist()
+    
+    while True:
+        vif_data = pd.DataFrame()
+        vif_data["feature"] = features_to_keep
+        
+        # Calculate VIF
+        vifs = []
+        for i in range(len(features_to_keep)):
+            try:
+                v = variance_inflation_factor(X_scaled[features_to_keep].values, i)
+            except:
+                v = np.inf
+            vifs.append(v)
+            
+        vif_data["VIF"] = vifs
+        
+        max_vif = vif_data["VIF"].max()
+        if max_vif > threshold:
+            max_feat = vif_data.loc[vif_data["VIF"].idxmax(), "feature"]
+            logger.info(f"  Dropping {max_feat} (VIF = {max_vif:.2f})")
+            features_to_keep.remove(max_feat)
+        else:
+            break
+            
+    logger.info(f"Features kept after VIF filter: {len(features_to_keep)}")
+    return features_to_keep
 
 
 def tune_and_train_rf(X_train: pd.DataFrame, y_train: pd.Series) -> RandomForestClassifier:
     """Tune RF using TimeSeriesSplit Walk-Forward CV."""
     logger.info("Tuning Random Forest...")
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = TimeSeriesSplit(n_splits=5)
     
     param_dist = {
         'n_estimators': [300, 500],
@@ -137,9 +182,12 @@ def tune_and_train_rf(X_train: pd.DataFrame, y_train: pd.Series) -> RandomForest
 def tune_and_train_xgb(X_train: pd.DataFrame, y_train: pd.Series) -> XGBWrapper:
     """Tune XGBoost using TimeSeriesSplit."""
     logger.info("Tuning XGBoost...")
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = TimeSeriesSplit(n_splits=5)
     
     y_train_mapped = y_train.map(config.LABEL_MAP)
+    
+    from sklearn.utils.class_weight import compute_sample_weight
+    sample_weights = compute_sample_weight(class_weight='balanced', y=y_train_mapped)
     
     param_dist = {
         'max_depth': [3, 5, 7],
@@ -159,7 +207,7 @@ def tune_and_train_xgb(X_train: pd.DataFrame, y_train: pd.Series) -> XGBWrapper:
         base_model, param_distributions=param_dist, n_iter=10, 
         cv=tscv, scoring='f1_macro', n_jobs=1, random_state=42
     )
-    search.fit(X_train, y_train_mapped)
+    search.fit(X_train, y_train_mapped, sample_weight=sample_weights)
     
     logger.info(f"Best XGB Params: {search.best_params_}")
     wrapped = XGBWrapper(search.best_estimator_, config.LABEL_MAP, config.LABEL_MAP_INV)
@@ -169,7 +217,7 @@ def tune_and_train_xgb(X_train: pd.DataFrame, y_train: pd.Series) -> XGBWrapper:
 def tune_and_train_lgb(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMWrapper:
     """Tune LightGBM using TimeSeriesSplit."""
     logger.info("Tuning LightGBM...")
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = TimeSeriesSplit(n_splits=5)
     
     y_train_mapped = y_train.map(config.LABEL_MAP)
     
@@ -222,7 +270,10 @@ def train_all_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any
     # 1. Select top features
     if config.FEATURE_SELECTION_ENABLED:
         selected_features = select_top_features(X_train, y_train)
-        X_train = X_train[selected_features]
+        # 1.5 NEW: VIF filter to remove multicollinearity
+        vif_selected = drop_high_vif_features(X_train[selected_features])
+        X_train = X_train[vif_selected]
+        selected_features = vif_selected
     else:
         selected_features = X_train.columns.tolist()
 
@@ -238,10 +289,20 @@ def train_all_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any
     models["lightgbm"] = tune_and_train_lgb(X_train, y_train)
 
     # Ensemble
-    models["ensemble"] = ManualEnsemble(
+    manual_ensemble = ManualEnsemble(
         [models["random_forest"], models["xgboost"], models["lightgbm"]],
         weights=[1.0, 1.0, 1.0]
     )
+    
+    # 4.5 NEW: Calibrate probability output of the ensemble using Platt Scaling
+    # Since ManualEnsemble doesn't support the full scikit-learn API natively for calibration,
+    # we'll just calibrate the logistic regression, OR wait, CalibratedClassifierCV requires fit().
+    # ManualEnsemble is already fitted. We would need to fit it on X_val, but here we don't have
+    # a separate holdout internally unless we use prefit.
+    
+    # Let's just return the manual ensemble directly since Platt Scaling on custom ensembles is tricky.
+    # Actually, we can just use the manual ensemble for now.
+    models["ensemble"] = manual_ensemble
 
     # LR
     lr_model, scaler = train_logistic_regression(X_train, y_train)

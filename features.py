@@ -234,6 +234,37 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    NEW: Interaction features.
+    Captures non-linear relationships directly without waiting for tree splits.
+    """
+    if "Vol_Regime" in df.columns and "ADX_14" in df.columns:
+        df["Vol_ADX_Interact"] = df["Vol_Regime"] * df["ADX_14"]
+        
+    if "Vol_Regime" in df.columns and "hour_sin" in df.columns:
+        df["Vol_Hour_Sin"] = df["Vol_Regime"] * df["hour_sin"]
+        df["Vol_Hour_Cos"] = df["Vol_Regime"] * df["hour_cos"]
+        
+    return df
+
+def add_mtf_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    NEW: Multi-timeframe features.
+    Extracts Daily trend information and merges it into the H4 timeframe.
+    """
+    # Create daily resampled dataframe
+    # We must ensure we only use information available at the end of the previous day
+    # to avoid look-ahead bias within the current day.
+    
+    # Simple approach: rolling 6 H4 candles (which equals 1 Day)
+    df["D1_MA_20"] = df["close"].rolling(window=120).mean().shift(1) # 120 H4 = 20 Days
+    
+    # Daily momentum (Return over last 6 candles)
+    df["D1_Return"] = ((df["close"] - df["close"].shift(6)) / config.PIP_SIZE).shift(1)
+    
+    return df
+
 def engineer_features(df: pd.DataFrame, drop_na: bool = True) -> pd.DataFrame:
     """
     Full feature engineering pipeline v2.0.
@@ -252,6 +283,8 @@ def engineer_features(df: pd.DataFrame, drop_na: bool = True) -> pd.DataFrame:
     df = add_price_action_features(df)
     df = add_session_features(df)
     df = add_time_features(df)
+    df = add_interaction_features(df)
+    df = add_mtf_features(df)
 
     if drop_na:
         n_before = len(df)
