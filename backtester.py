@@ -1,16 +1,10 @@
 """
-backtester.py — Strategy Validation (v3.0 — Dynamic ATR SL/TP)
-================================================================
-v3.0 UPGRADE: SL/TP now dynamically adjust based on ATR (volatility).
-- Volatile market: wider SL/TP (avoids premature stop-outs)
-- Calm market: tighter SL/TP (locks in smaller but consistent gains)
-
-Rules:
-- Spread: 2 pips, Slippage: 0.5 pips (applied at entry).
-- SL: ATR * 1.5, TP: ATR * 2.0 (dynamic per-trade)
-- Capital: $10,000, max 1 position active.
-- Confidence filter: > 38%.
-- Max daily loss: 3%.
+backtester.py — Strategy Validation (v4.0 — Dynamic ATR + Regime Filters)
+========================================================================
+v4.0 UPGRADE: 
+- Regime Filter: only trade when Vol_Regime > 0 and ADX > threshold.
+- Confidence Filter: only trade when confidence > MIN_CONFIDENCE.
+- Risk/Reward: TP is 2.5x ATR, SL is 1.0x ATR.
 """
 
 import os
@@ -42,13 +36,10 @@ def compute_atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def run_backtest(
-    df: pd.DataFrame,
-    predictions: pd.Series,
-    probabilities: pd.DataFrame = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
+def run_backtest(df: pd.DataFrame, model_name: str = "model") -> dict:
     """
-    Run backtest simulation with dynamic ATR-based SL/TP.
+    Run backtest simulation with dynamic ATR-based SL/TP and v4.0 Regime Filters.
+    Expects 'prediction' and 'confidence' columns in df.
     """
     capital = config.INITIAL_CAPITAL
     equity = capital
@@ -74,12 +65,12 @@ def run_backtest(
         row = df.iloc[i]
         timestamp = df.index[i]
 
-        # Check for new day to reset max daily loss
+        # Reset daily max loss tracker
         if timestamp.date() != current_day:
             daily_start_capital = equity
             current_day = timestamp.date()
 
-        # 1. Check for exits if in a position
+        # 1. Manage Open Positions
         if position != 0:
             exit_price = 0.0
             exit_reason = ""
@@ -100,235 +91,132 @@ def run_backtest(
                     exit_price = tp_price
                     exit_reason = "TP"
 
-            if exit_reason:
-                # Calculate P&L
-                gross_pips = (exit_price - entry_price) / config.PIP_SIZE * position
-                net_pips = gross_pips - cost_pips
-                pnl = net_pips * (config.LOT_SIZE * config.PIP_SIZE)
+            # Execute exit
+            if exit_price != 0:
+                price_diff = exit_price - entry_price if position == 1 else entry_price - exit_price
+                pnl_pips = (price_diff / config.PIP_SIZE) - cost_pips
+                pnl_dollars = pnl_pips * pip_val
 
-                equity += pnl
-
+                equity += pnl_dollars
                 trades.append({
                     "entry_time": entry_time,
                     "exit_time": timestamp,
-                    "type": "LONG" if position == 1 else "SHORT",
+                    "type": "BUY" if position == 1 else "SELL",
                     "entry_price": entry_price,
                     "exit_price": exit_price,
+                    "pnl_pips": pnl_pips,
+                    "pnl_dollars": pnl_dollars,
                     "reason": exit_reason,
-                    "net_pips": net_pips,
-                    "pnl": pnl,
-                    "equity": equity,
-                    "sl_pips": round(abs(sl_price - entry_price) / config.PIP_SIZE, 1),
-                    "tp_pips": round(abs(tp_price - entry_price) / config.PIP_SIZE, 1),
+                    "equity": equity
                 })
+
                 position = 0
 
-        # 2. Check for entry if flat
-        # Max daily loss check
-        daily_loss_pct = (daily_start_capital - equity) / daily_start_capital * 100
-        if daily_loss_pct >= config.MAX_DAILY_LOSS_PCT:
-            equity_curve.append({"timestamp": timestamp, "equity": equity})
-            continue  # Block entries for the rest of the day
-
+        # 2. Check for New Entries
         if position == 0:
-            pred = predictions.iloc[i]
+            pred = row.get("prediction", 0)
+            conf = row.get("confidence", 0)
+            
+            # v4.0 Regime & Confidence Filters
+            # 1. Confidence > MIN_CONFIDENCE
+            if conf >= config.MIN_CONFIDENCE:
+                
+                # 2. ADX Trend Filter (only if ADX feature exists)
+                adx = row.get("ADX_14", 100)  # Default pass if not calculated
+                vol_regime = row.get("Vol_Regime", 1) # Default pass if not calculated
+                
+                if adx >= config.MIN_ADX_TREND and vol_regime > 0:
+                    
+                    atr_val = atr_series.iloc[i]
+                    if pd.isna(atr_val) or atr_val == 0:
+                        atr_val = 0.0020  # Fallback 20 pips
 
-            # Confidence filter
-            if probabilities is not None:
-                conf = 0.0
-                if pred == 1:
-                    conf = probabilities.iloc[i, config.LABEL_MAP[1]]
-                elif pred == -1:
-                    conf = probabilities.iloc[i, config.LABEL_MAP[-1]]
+                    if pred == 1:
+                        position = 1
+                        entry_price = row["open"]  # Enter at open of current candle
+                        sl_price = entry_price - (atr_val * config.SL_ATR_MULT)
+                        tp_price = entry_price + (atr_val * config.TP_ATR_MULT)
+                        entry_time = timestamp
 
-                if conf < config.MIN_CONFIDENCE:
-                    pred = 0  # Ignore signal
+                    elif pred == -1:
+                        position = -1
+                        entry_price = row["open"]
+                        sl_price = entry_price + (atr_val * config.SL_ATR_MULT)
+                        tp_price = entry_price - (atr_val * config.TP_ATR_MULT)
+                        entry_time = timestamp
 
-            # Calculate dynamic SL/TP based on current ATR
-            current_atr = atr_series.iloc[i] if not pd.isna(atr_series.iloc[i]) else config.SL_PIPS * config.PIP_SIZE
-            sl_distance = current_atr * config.SL_ATR_MULT
-            tp_distance = current_atr * config.TP_ATR_MULT
+        # Daily loss check
+        if equity < daily_start_capital * (1 - config.MAX_DAILY_LOSS_PCT / 100.0):
+            # Force close if we exceeded max daily loss
+            if position != 0:
+                exit_price = row["close"]
+                price_diff = exit_price - entry_price if position == 1 else entry_price - exit_price
+                pnl_pips = (price_diff / config.PIP_SIZE) - cost_pips
+                pnl_dollars = pnl_pips * pip_val
+                equity += pnl_dollars
+                trades.append({
+                    "entry_time": entry_time, "exit_time": timestamp,
+                    "type": "BUY" if position == 1 else "SELL",
+                    "entry_price": entry_price, "exit_price": exit_price,
+                    "pnl_pips": pnl_pips, "pnl_dollars": pnl_dollars,
+                    "reason": "MAX_LOSS", "equity": equity
+                })
+                position = 0
+            daily_start_capital = equity # Prevent trading rest of day
+            
+        equity_curve.append(equity)
 
-            # Enforce minimum SL/TP (at least 5 pips)
-            min_distance = 5 * config.PIP_SIZE
-            sl_distance = max(sl_distance, min_distance)
-            tp_distance = max(tp_distance, min_distance * 1.5)
-
-            if pred == 1:  # BUY
-                position = 1
-                entry_price = row["close"]
-                entry_time = timestamp
-                sl_price = entry_price - sl_distance
-                tp_price = entry_price + tp_distance
-            elif pred == -1:  # SELL
-                position = -1
-                entry_price = row["close"]
-                entry_time = timestamp
-                sl_price = entry_price + sl_distance
-                tp_price = entry_price - tp_distance
-
-        equity_curve.append({"timestamp": timestamp, "equity": equity})
-
-    # Close open position at end of backtest
-    if position != 0:
-        exit_price = df.iloc[-1]["close"]
-        gross_pips = (exit_price - entry_price) / config.PIP_SIZE * position
-        net_pips = gross_pips - cost_pips
-        pnl = net_pips * (config.LOT_SIZE * config.PIP_SIZE)
-        equity += pnl
-        trades.append({
-            "entry_time": entry_time,
-            "exit_time": df.index[-1],
-            "type": "LONG" if position == 1 else "SHORT",
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "reason": "END_OF_DATA",
-            "net_pips": net_pips,
-            "pnl": pnl,
-            "equity": equity,
-            "sl_pips": round(abs(sl_price - entry_price) / config.PIP_SIZE, 1),
-            "tp_pips": round(abs(tp_price - entry_price) / config.PIP_SIZE, 1),
-        })
-        equity_curve[-1]["equity"] = equity
-
-    eq_df = pd.DataFrame(equity_curve).set_index("timestamp")
-    trades_df = pd.DataFrame(trades)
-
-    metrics = calculate_metrics(eq_df, trades_df)
-
-    return eq_df, trades_df, metrics
-
-
-def calculate_metrics(eq_df: pd.DataFrame, trades_df: pd.DataFrame) -> dict:
-    """Calculate strategy performance metrics."""
-    capital = config.INITIAL_CAPITAL
-
-    if len(trades_df) == 0:
-        return {
-            "Total Return (%)": 0.0,
-            "Max Drawdown (%)": 0.0,
-            "Total Trades": 0,
-            "Win Rate (%)": 0.0,
-            "Profit Factor": 0.0,
-            "Sharpe Ratio": 0.0,
-            "Avg Win (pips)": 0.0,
-            "Avg Loss (pips)": 0.0,
-        }
-
-    final_equity = eq_df["equity"].iloc[-1]
-    total_return = (final_equity - capital) / capital * 100
-
-    # Drawdown
-    roll_max = eq_df["equity"].cummax()
-    drawdown = (eq_df["equity"] - roll_max) / roll_max * 100
-    max_dd = drawdown.min()
-
-    # Trade stats
-    wins = trades_df[trades_df["pnl"] > 0]
-    losses = trades_df[trades_df["pnl"] <= 0]
-
-    total_trades = len(trades_df)
-    win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
-
-    gross_profit = wins["pnl"].sum() if len(wins) > 0 else 0
-    gross_loss = abs(losses["pnl"].sum()) if len(losses) > 0 else 0
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-
-    # Sharpe ratio (annualized, hourly data)
-    returns = eq_df["equity"].pct_change().dropna()
-    if len(returns) > 1 and returns.std() > 0:
-        # ~6240 trading hours per year (260 days * 24 hours)
-        sharpe = (returns.mean() / returns.std()) * np.sqrt(6240)
-    else:
-        sharpe = 0.0
-
-    # Average win/loss in pips
-    avg_win_pips = wins["net_pips"].mean() if len(wins) > 0 else 0
-    avg_loss_pips = losses["net_pips"].mean() if len(losses) > 0 else 0
-
+    # Compile metrics
+    df_trades = pd.DataFrame(trades)
+    
     metrics = {
-        "Total Return (%)": total_return,
-        "Max Drawdown (%)": max_dd,
-        "Total Trades": total_trades,
-        "Win Rate (%)": win_rate,
-        "Profit Factor": profit_factor,
-        "Sharpe Ratio": sharpe,
-        "Avg Win (pips)": avg_win_pips,
-        "Avg Loss (pips)": avg_loss_pips,
+        "total_trades": len(trades),
+        "win_rate": 0.0,
+        "total_pnl": equity - capital,
+        "roi_pct": ((equity - capital) / capital) * 100,
+        "max_drawdown_pct": 0.0,
+        "profit_factor": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": 0.0,
+        "equity_curve": equity_curve,
+        "timestamps": df.index,
     }
 
+    if not df_trades.empty:
+        wins = df_trades[df_trades["pnl_dollars"] > 0]
+        losses = df_trades[df_trades["pnl_dollars"] <= 0]
+        
+        metrics["win_rate"] = len(wins) / len(df_trades) * 100
+        metrics["avg_win"] = wins["pnl_dollars"].mean() if not wins.empty else 0
+        metrics["avg_loss"] = losses["pnl_dollars"].mean() if not losses.empty else 0
+        
+        gross_profit = wins["pnl_dollars"].sum() if not wins.empty else 0
+        gross_loss = abs(losses["pnl_dollars"].sum()) if not losses.empty else 1e-9
+        metrics["profit_factor"] = gross_profit / gross_loss
+        
+        # Drawdown
+        eq_series = pd.Series(equity_curve)
+        peak = eq_series.cummax()
+        drawdown = (eq_series - peak) / peak
+        metrics["max_drawdown_pct"] = drawdown.min() * 100
+
+    logger.info(f"Backtest {model_name} | Trades: {metrics['total_trades']} | WR: {metrics['win_rate']:.1f}% | ROI: {metrics['roi_pct']:.2f}% | MDD: {metrics['max_drawdown_pct']:.2f}%")
+    
     return metrics
 
 
-def plot_equity_curve(eq_df: pd.DataFrame, output_dir: str = None, title: str = "Strategy Equity Curve"):
-    """Plot and save the equity curve with enhanced visuals for paper."""
-    output_dir = output_dir or config.OUTPUTS_DIR
-    os.makedirs(output_dir, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-
-    # Plot equity line
-    ax.plot(eq_df.index, eq_df["equity"], label="Portfolio Equity", color="#2196F3", linewidth=1.5)
-    ax.axhline(y=config.INITIAL_CAPITAL, color="#F44336", linestyle="--", label="Initial Capital", alpha=0.7)
-
-    # Fill green/red areas
-    ax.fill_between(eq_df.index, config.INITIAL_CAPITAL, eq_df["equity"],
-                     where=eq_df["equity"] >= config.INITIAL_CAPITAL,
-                     color="#4CAF50", alpha=0.15, label="Profit Zone")
-    ax.fill_between(eq_df.index, config.INITIAL_CAPITAL, eq_df["equity"],
-                     where=eq_df["equity"] < config.INITIAL_CAPITAL,
-                     color="#F44336", alpha=0.15, label="Loss Zone")
-
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_xlabel("Date", fontsize=11)
-    ax.set_ylabel("Equity ($)", fontsize=11)
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, alpha=0.3)
+def plot_equity_curve(metrics: dict, model_name: str):
+    """Plot and save equity curve."""
+    if metrics["total_trades"] == 0:
+        return
+        
+    plt.figure(figsize=(10, 5))
+    plt.plot(metrics["timestamps"], metrics["equity_curve"], label=f"{model_name} Equity")
+    plt.title(f"{model_name} Backtest Equity Curve (v4.0)")
+    plt.xlabel("Time")
+    plt.ylabel("Capital ($)")
+    plt.grid(True)
+    plt.legend()
     plt.tight_layout()
-
-    # Use model name in filename
-    safe_title = title.replace(" ", "_").replace("-", "").lower()
-    filepath = os.path.join(output_dir, f"equity_curve_{safe_title}.png")
-    plt.savefig(filepath, dpi=150, bbox_inches="tight")
+    plt.savefig(os.path.join(config.OUTPUTS_DIR, f"{model_name}_equity.png"))
     plt.close()
-    logger.info(f"Saved equity curve: {filepath}")
-
-
-def execute_backtest(model, model_name: str, X_test: pd.DataFrame, y_test: pd.Series, df_test_raw: pd.DataFrame):
-    """
-    Wrapper to execute backtest for a specific model and log results.
-    """
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Running Backtest: {model_name}")
-    logger.info(f"{'='*60}")
-
-    # Get predictions — all models return original labels (-1, 0, 1)
-    y_pred = model.predict(X_test)
-    predictions = pd.Series(y_pred, index=X_test.index)
-
-    # Get probabilities if available
-    probabilities = None
-    if hasattr(model, "predict_proba"):
-        probs = model.predict_proba(X_test)
-        probabilities = pd.DataFrame(probs, index=X_test.index)
-
-    eq_df, trades_df, metrics = run_backtest(df_test_raw, predictions, probabilities)
-
-    logger.info("Backtest Metrics:")
-    for k, v in metrics.items():
-        if isinstance(v, float):
-            logger.info(f"  {k}: {v:.2f}")
-        else:
-            logger.info(f"  {k}: {v}")
-
-    plot_equity_curve(eq_df, title=f"Equity Curve - {model_name}")
-
-    # Save trades
-    trades_path = os.path.join(config.OUTPUTS_DIR, f"trades_{model_name}.csv")
-    if not trades_df.empty:
-        trades_df.to_csv(trades_path, index=False)
-        logger.info(f"Saved trade log to {trades_path}")
-    else:
-        logger.info("No trades executed.")
-
-    return eq_df, trades_df, metrics

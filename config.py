@@ -21,7 +21,7 @@ OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
 # Instrument & Timeframe
 # ──────────────────────────────────────────────────────────────
 PAIR = "EURUSD"
-TIMEFRAME = "H1"
+TIMEFRAME = "H4"  # v4.0: H4 timeframe for higher signal-to-noise ratio
 PIP_SIZE = 0.0001  # 1 pip = 0.0001 for EUR/USD
 
 # Timezone conversion (histdata.com default is EST)
@@ -39,8 +39,8 @@ LABEL_SELL_THRESHOLD = -10  # pip_return < -10 -> SELL (-1)
 
 # ATR-based thresholds (used if LABEL_MODE == "atr")
 LABEL_ATR_PERIOD = 14       # ATR lookback period for labeling
-LABEL_ATR_MULTIPLIER = 0.7  # threshold = ATR * multiplier
-# Example: if ATR=12 pips, threshold = 12*0.7 = 8.4 pips
+LABEL_ATR_MULTIPLIER = 0.5  # v4.0: threshold = 0.5x ATR (lower = more BUY/SELL labels)
+# Example: if H4 ATR=28 pips, threshold = 28*0.5 = 14 pips
 # This creates MORE BUY/SELL labels in volatile markets,
 # and FEWER in calm markets — exactly what we want.
 
@@ -146,9 +146,9 @@ LR_PARAMS = {
 SPREAD_PIPS = 2.0
 SLIPPAGE_PIPS = 0.5
 
-# Dynamic SL/TP (v3.0): SL = ATR * SL_ATR_MULT, TP = ATR * TP_ATR_MULT
-SL_ATR_MULT = 1.5   # SL = 1.5x ATR (tight enough to limit loss)
-TP_ATR_MULT = 2.0   # TP = 2.0x ATR (gives room to profit)
+# Dynamic SL/TP (v4.0): Wider TP, tighter SL
+SL_ATR_MULT = 1.0   # v4.0: SL = 1.0x ATR
+TP_ATR_MULT = 2.5   # v4.0: TP = 2.5x ATR (Risk:Reward = 1:2.5)
 # Risk:Reward = 1:1.33 — with a decent model, this is profitable
 
 # Fallback fixed SL/TP (used only if ATR not available)
@@ -157,14 +157,15 @@ TP_PIPS = 40
 
 INITIAL_CAPITAL = 10_000
 MAX_POSITIONS = 1
-MIN_CONFIDENCE = 0.38   # v3.0: calibrated lower for more trades
+MIN_CONFIDENCE = 0.45   # v4.0: Realistic for 3-class (higher than v3's 0.38)
+MIN_ADX_TREND = 15.0    # v4.0: Regime filter (mild: ADX > 15 = slight trend)
 MAX_DAILY_LOSS_PCT = 3.0
 LOT_SIZE = 10_000  # mini lot
 
 # ──────────────────────────────────────────────────────────────
 # Model Registry / Versioning
 # ──────────────────────────────────────────────────────────────
-MODEL_VERSION = "v3.0.0"
+MODEL_VERSION = "v4.0.0"
 
 # ──────────────────────────────────────────────────────────────
 # Monitoring

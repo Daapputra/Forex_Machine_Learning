@@ -115,16 +115,15 @@ def add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
     if atr is not None:
         df["ATR_14"] = atr.shift(1)
 
-        # NEW: ATR ratio — current ATR / rolling mean ATR(50)
-        # Values > 1 = higher volatility than normal, < 1 = calmer than normal
+        # v4.0: ATR ratio — current ATR / rolling mean ATR(50)
         atr_mean_50 = atr.rolling(50).mean()
         atr_mean_safe = atr_mean_50.replace(0, np.nan)
         df["ATR_Ratio"] = (atr / atr_mean_safe).shift(1)
 
-        # NEW: Volatility regime — simple bucketing for the model
-        # 0 = low vol, 1 = normal, 2 = high vol
+        # v4.0: Volatility regime — rolling percentile ATR 90 days
+        # For H4 timeframe, 90 days = 90 * 6 = 540 candles
         atr_pct = atr / df["close"]
-        atr_pct_rolling = atr_pct.rolling(100).rank(pct=True)
+        atr_pct_rolling = atr_pct.rolling(540).rank(pct=True)
         df["Vol_Regime"] = pd.cut(
             atr_pct_rolling, bins=[0, 0.33, 0.66, 1.0],
             labels=[0, 1, 2], include_lowest=True
@@ -242,7 +241,7 @@ def engineer_features(df: pd.DataFrame, drop_na: bool = True) -> pd.DataFrame:
 
     Total features: ~45 (up from 24 in v1.0)
     """
-    logger.info("Engineering features (v2.0 — expanded feature set)...")
+    logger.info("Engineering features (v4.0 - pruned feature set)...")
 
     df = df.copy()
 
@@ -260,6 +259,20 @@ def engineer_features(df: pd.DataFrame, drop_na: bool = True) -> pd.DataFrame:
         n_dropped = n_before - len(df)
         logger.info(f"Dropped {n_dropped} rows due to indicator warmup NaNs. "
                     f"Remaining: {len(df)} rows.")
+
+    # v4.0: Explicitly drop weak features identified in Phase 1 diagnostics to reduce noise
+    weak_features = [
+        'MA_10', 'MA_20', 'MA_50', 'EMA_12', 'EMA_26', 'MA_Cross', 
+        'Dist_MA_20', 'Dist_MA_50', 'RSI_14', 'Stoch_K', 'MACD', 
+        'MACD_Hist', 'WillR_14', 'Return_10', 'RetMean_6', 
+        'RetMean_12', 'Candle_Dir', 'Consec_Candles', 'is_asian', 
+        'is_ny', 'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+    ]
+    # We keep Vol_Regime because it was upgraded to 90d ATR percentile
+    
+    cols_to_drop = [c for c in weak_features if c in df.columns]
+    df.drop(columns=cols_to_drop, inplace=True)
+    logger.info(f"Dropped {len(cols_to_drop)} weak features (v4.0 pruning).")
 
     non_feature_cols = ["open", "high", "low", "close", "volume", "pip_return", "label"]
     feature_cols = [c for c in df.columns if c not in non_feature_cols]

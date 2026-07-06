@@ -60,7 +60,7 @@ def load_m1_data(data_dir: str = None) -> pd.DataFrame:
     # CRITICAL: Sort by datetime chronologically (especially when combining multiple files)
     df.sort_index(inplace=True)
 
-    logger.info(f"Loaded {len(df)} total M1 rows, range: {df.index[0]} — {df.index[-1]}")
+    logger.info(f"Loaded {len(df)} total M1 rows, range: {df.index[0]} - {df.index[-1]}")
 
     return df
 
@@ -88,7 +88,7 @@ def convert_timezone(df: pd.DataFrame,
     source_tz = source_tz or config.SOURCE_TZ
     target_tz = target_tz or config.TARGET_TZ
 
-    logger.info(f"Converting timezone: {source_tz} → {target_tz}")
+    logger.info(f"Converting timezone: {source_tz} -> {target_tz}")
 
     df = df.copy()
     df.index = df.index.tz_localize(source_tz).tz_convert(target_tz)
@@ -96,60 +96,45 @@ def convert_timezone(df: pd.DataFrame,
     return df
 
 
-def resample_to_h1(df: pd.DataFrame) -> pd.DataFrame:
+def resample_to_tf(df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
     """
-    Resample M1 data to H1 (1-hour) candles with proper OHLCV aggregation.
-
-    Aggregation rules:
-        - open:   first (opening price of the hour)
-        - high:   max   (highest price during the hour)
-        - low:    min   (lowest price during the hour)
-        - close:  last  (closing price of the hour)
-        - volume: sum   (total volume during the hour)
-
-    Weekend gaps are NOT filled — they are naturally absent from the data.
-
-    Returns
-    -------
-    pd.DataFrame
-        H1 OHLCV DataFrame.
+    Resample M1 data to a higher timeframe (e.g., '4h', '1h').
     """
-    logger.info("Resampling M1 → H1...")
+    timeframe = timeframe or config.TIMEFRAME
 
-    ohlcv_agg = {
+    # Use '4h' or whatever config.TIMEFRAME dictates.
+    # Note: 'H' is deprecated in pandas 2.2.0+, 'h' is used.
+    # If config says 'H4', we convert to '4h'
+    pandas_tf = timeframe.lower()
+    if pandas_tf == 'h4': pandas_tf = '4h'
+    elif pandas_tf == 'h1': pandas_tf = '1h'
+
+    logger.info(f"Resampling M1 -> {timeframe}...")
+
+    resampled_df = df.resample(pandas_tf).agg({
         "open": "first",
         "high": "max",
         "low": "min",
         "close": "last",
         "volume": "sum",
-    }
+    })
 
-    df_h1 = df.resample("1h").agg(ohlcv_agg).dropna()
+    resampled_df.dropna(inplace=True)
 
-    logger.info(f"H1 resampled: {len(df_h1)} candles, "
-                f"range: {df_h1.index[0]} — {df_h1.index[-1]}")
+    logger.info(f"{timeframe} resampled: {len(resampled_df)} candles, range: {resampled_df.index[0]} - {resampled_df.index[-1]}")
 
-    return df_h1
+    return resampled_df
 
 
-def load_data(filepath: str = None) -> pd.DataFrame:
+def load_data(data_dir: str = None) -> pd.DataFrame:
     """
-    Full data loading pipeline: Load M1 → Convert TZ → Resample to H1.
-
-    This is the main entry point for Phase 1 data loading.
-
-    Parameters
-    ----------
-    filepath : str, optional
-        Path to M1 CSV file.
-
-    Returns
-    -------
-    pd.DataFrame
-        Clean H1 OHLCV DataFrame with UTC DatetimeIndex.
+    Complete data loading pipeline:
+    1. Load raw M1 CSVs
+    2. Convert timezone (EST -> UTC)
+    3. Resample to target timeframe (e.g., 4H)
     """
-    df_m1 = load_m1_data(filepath)
-    df_m1 = convert_timezone(df_m1)
-    df_h1 = resample_to_h1(df_m1)
+    df_m1 = load_m1_data(data_dir)
+    df_utc = convert_timezone(df_m1)
+    df_tf = resample_to_tf(df_utc)
 
-    return df_h1
+    return df_tf

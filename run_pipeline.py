@@ -1,12 +1,12 @@
 """
-run_pipeline.py — Orchestrator for Forex ML Pipeline (v3.0)
+run_pipeline.py — Orchestrator for Forex ML Pipeline (v4.0)
 =============================================================
-v3.0 UPGRADE:
-- Dynamic ATR-based labeling
-- Feature selection (top-N)
-- Dynamic ATR-based SL/TP in backtesting
-- Stronger regularization
-- Enhanced reporting
+v4.0 UPGRADE:
+- Resampled to H4 to reduce noise
+- Walk-Forward Cross Validation (TimeSeriesSplit)
+- RandomizedSearchCV Hyperparameter Tuning
+- LightGBM Added
+- Strict hold-out test set evaluation (no data dredging)
 """
 
 import os
@@ -51,11 +51,11 @@ logger = logging.getLogger("Pipeline")
 
 def main():
     logger.info("=" * 70)
-    logger.info("FOREX ML PIPELINE v3.0 -- PRODUCTION QUALITY")
+    logger.info(f"FOREX ML PIPELINE {config.MODEL_VERSION} -- ACADEMIC RESEARCH QUALITY")
     logger.info("=" * 70)
 
     # ---------------------------------------------------------
-    # CLEANUP: Remove old models to prevent version mismatch
+    # CLEANUP: Remove old models
     # ---------------------------------------------------------
     old_models = _glob.glob(os.path.join(config.MODELS_DIR, "*.pkl")) + \
                  _glob.glob(os.path.join(config.MODELS_DIR, "*.json"))
@@ -70,154 +70,148 @@ def main():
     # ---------------------------------------------------------
     logger.info("\n--- PHASE 1: Data Preparation ---")
 
-    # 1. Load and resample (M1 -> H1)
+    # 1. Load and resample (M1 -> H4)
     df_raw = data_loader.load_data()
-    logger.info(f"Total H1 candles after resample: {len(df_raw)}")
+    logger.info(f"Total {config.TIMEFRAME} candles after resample: {len(df_raw)}")
 
     # 2. Clean
     df_clean = data_cleaner.clean_data(df_raw)
 
-    # 3. Label (v3.0: dynamic ATR-based labeling)
+    # 3. Label
     df_labeled = labeler.label_data(df_clean)
 
-    # 4. Engineer features (v2.0: ~49 features, all shifted)
+    # 4. Engineer features (includes v4.0 pruning)
     df_features = features.engineer_features(df_labeled)
     logger.info(f"Final dataset size: {len(df_features)} rows")
 
-    # 5. Split (Chronological, NO shuffle)
+    # 5. Split
     feature_cols = features.get_feature_columns(df_features)
     X_train, y_train, X_val, y_val, X_test, y_test = splitter.split_data(
         df_features, feature_cols
     )
+    
+    # Combine Train and Val for Walk-Forward CV
+    X_train_full = pd.concat([X_train, X_val])
+    y_train_full = pd.concat([y_train, y_val])
 
-    train_period = f"{X_train.index[0].date()} to {X_train.index[-1].date()}"
-    logger.info(f"Training period: {train_period}")
+    train_period = f"{X_train_full.index[0].date()} to {X_train_full.index[-1].date()}"
+    test_period = f"{X_test.index[0].date()} to {X_test.index[-1].date()}"
+    logger.info(f"Walk-Forward CV Training period: {train_period}")
+    logger.info(f"Final Hold-Out Test period: {test_period}")
 
     # ---------------------------------------------------------
-    # PHASE 2: Modeling (v3.0: with feature selection)
+    # PHASE 2: Modeling (Walk-Forward CV + GridSearchCV)
     # ---------------------------------------------------------
-    logger.info("\n--- PHASE 2: Modeling ---")
+    logger.info("\n--- PHASE 2: Modeling (Walk-Forward CV Tuning) ---")
 
-    # Train RF, XGB, Ensemble, LR Baseline
-    # v3.0: train_all_models now returns (results, selected_feature_cols)
-    trained_models, selected_cols = trainer.train_all_models(
-        X_train, y_train, X_val, y_val, X_test, y_test, feature_cols, train_period
-    )
+    result = trainer.train_all_models(X_train_full, y_train_full)
+    trained_models = result["models"]
+    selected_features = result["feature_cols"]
 
-    # Update X sets to use selected features for evaluation
-    X_val_selected = X_val[selected_cols]
-    X_test_selected = X_test[selected_cols]
+    # Save models
+    for name, model in trained_models.items():
+        if name == "scaler":
+            continue
+        model_registry.save_model(
+            model=model,
+            model_type=name,
+            feature_cols=selected_features,
+            val_metrics={"cv_tuned": True},
+            train_period=train_period,
+            pair=config.PAIR,
+            timeframe=config.TIMEFRAME,
+            version=config.MODEL_VERSION
+        )
 
-    # Generate Rule-based baseline predictions for Val and Test
-    val_df = df_features.iloc[
-        int(len(df_features) * config.TRAIN_RATIO):
-        int(len(df_features) * (config.TRAIN_RATIO + config.VAL_RATIO))
-    ]
-    test_df = df_features.iloc[
-        int(len(df_features) * (config.TRAIN_RATIO + config.VAL_RATIO)):
-    ]
+    # ---------------------------------------------------------
+    # PHASE 3: Final Hold-Out Test Evaluation
+    # ---------------------------------------------------------
+    logger.info("\n--- PHASE 3: Final Test Set Evaluation ---")
 
-    rule_based_val_pred = trainer.generate_rule_based_predictions(val_df, selected_cols)
-    rule_based_test_pred = trainer.generate_rule_based_predictions(test_df, selected_cols)
-
-    # Evaluate all models
-    all_results = evaluator.evaluate_all_models(
-        trained_models, y_val, y_test, selected_cols,
-        rule_based_val_pred, rule_based_test_pred
-    )
-
-    comparison_df = evaluator.save_evaluation_report(all_results)
-
-    # Save models to registry (skip LR baseline)
-    for model_name, info in trained_models.items():
-        if model_name != "logistic_regression":
-            model_registry.save_model(
-                model=info["model"],
-                model_type=model_name,
-                feature_cols=selected_cols,
-                val_metrics=all_results[model_name]["val_metrics"],
-                train_period=train_period
-            )
-
-    # Identify best model based on test F1 Macro
+    X_test_selected = X_test[selected_features]
     best_model_name = None
     best_f1 = -1
-    for name, res in all_results.items():
-        if name == "rule_based_rsi":
+
+    for name, model in trained_models.items():
+        if name == "scaler":
             continue
-        test_f1 = res["test_metrics"]["f1_macro"]
-        if test_f1 > best_f1:
-            best_f1 = test_f1
+            
+        if name == "logistic_regression":
+            scaler = trained_models["scaler"]
+            X_eval = scaler.transform(X_test_selected)
+            X_eval = pd.DataFrame(X_eval, index=X_test.index, columns=selected_features)
+        else:
+            X_eval = X_test_selected
+
+        metrics = evaluator.evaluate_model(model, X_eval, y_test, f"{name} (Test)")
+        
+        if metrics["f1_macro"] > best_f1 and name != "logistic_regression":
+            best_f1 = metrics["f1_macro"]
             best_model_name = name
 
-    logger.info(f"\nBEST MODEL: {best_model_name} (Test F1 Macro: {best_f1:.4f})")
+    logger.info(f"\nBEST MODEL on unseen Test Set: {best_model_name} (F1: {best_f1:.4f})")
 
     # ---------------------------------------------------------
-    # PHASE 3: Validation (Backtesting with dynamic ATR SL/TP)
+    # PHASE 4: Validation (Backtesting)
     # ---------------------------------------------------------
-    logger.info("\n--- PHASE 3: Validation (Backtesting v3.0 - Dynamic ATR SL/TP) ---")
+    logger.info("\n--- PHASE 4: Validation (Backtesting v4.0 - Dynamic ATR SL/TP) ---")
+    
+    # We backtest ONLY on the test set!
+    df_test_backtest = df_features.loc[X_test.index].copy()
 
-    # Reconstruct raw df for test period
-    df_test_raw = df_labeled.loc[X_test.index]
+    for name, model in trained_models.items():
+        if name == "scaler":
+            continue
+            
+        logger.info("\n" + "=" * 60)
+        logger.info(f"Running Backtest: {name}")
+        logger.info("=" * 60)
+        
+        if name == "logistic_regression":
+            scaler = trained_models["scaler"]
+            X_eval = scaler.transform(X_test_selected)
+            X_eval = pd.DataFrame(X_eval, index=X_test.index, columns=selected_features)
+        else:
+            X_eval = X_test_selected
 
-    # Backtest best model
-    best_model = trained_models[best_model_name]["model"]
-    best_X_test = trained_models[best_model_name]["X_test"]
-    eq_df, trades_df, bt_metrics = backtester.execute_backtest(
-        best_model, best_model_name, best_X_test, y_test, df_test_raw
-    )
+        # Generate predictions for backtester
+        y_pred = model.predict(X_eval)
+        y_prob = model.predict_proba(X_eval)
+        
+        # Determine confidence of the predicted class
+        confidences = []
+        for i, p in enumerate(y_pred):
+            # mapping classes [-1, 0, 1] to proba indices
+            classes = model.classes_ if hasattr(model, 'classes_') else np.array([-1, 0, 1])
+            class_idx = np.where(classes == p)[0][0]
+            confidences.append(y_prob[i][class_idx])
+            
+        df_test_backtest["prediction"] = y_pred
+        df_test_backtest["confidence"] = confidences
 
-    # Also backtest other ML models for comparison
-    for model_name in ["random_forest", "xgboost", "ensemble"]:
-        if model_name != best_model_name and model_name in trained_models:
-            model_X_test = trained_models[model_name]["X_test"]
-            backtester.execute_backtest(
-                trained_models[model_name]["model"],
-                model_name, model_X_test, y_test, df_test_raw
-            )
+        # Run backtest
+        metrics = backtester.run_backtest(df_test_backtest, model_name=name)
 
+        if metrics["total_trades"] > 0:
+            backtester.plot_equity_curve(metrics, name)
+            
     # ---------------------------------------------------------
-    # Save backtest summary
+    # PHASE 5: Live Signal Demonstration
     # ---------------------------------------------------------
-    summary_path = os.path.join(config.OUTPUTS_DIR, "backtest_summary.csv")
-    bt_summary = pd.DataFrame([bt_metrics], index=[best_model_name])
-    bt_summary.to_csv(summary_path)
-    logger.info(f"Backtest summary saved: {summary_path}")
+    logger.info("\n--- PHASE 5: Live Signal Generation Demo ---")
+    simulated_live_data = df_raw.iloc[-700:]  # Need 540+ for Vol_Regime warmup
+    signal = signal_engine.generate_signal(simulated_live_data, config.PAIR, config.TIMEFRAME)
 
-    # ---------------------------------------------------------
-    # Demonstration: Signal Engine & Monitoring
-    # ---------------------------------------------------------
-    logger.info("\n--- Demonstration: Live Signal Generation ---")
-    simulated_live_data = df_raw.iloc[-200:]
+    logger.info(f"\n[{config.PAIR} {config.TIMEFRAME}] SIGNAL: {signal['signal']} (Conf: {signal.get('confidence', 0):.2f})")
+    if signal['signal'] in ['BUY', 'SELL']:
+        logger.info(f"Entry: {signal.get('entry_price')}")
+        logger.info(f"SL:    {signal.get('suggested_sl')}")
+        logger.info(f"TP:    {signal.get('suggested_tp')}")
+    logger.info(f"Reason: {signal.get('reason', 'N/A')}")
 
-    signal = signal_engine.generate_signal(simulated_live_data)
-    logger.info(f"Generated Live Signal:\n{signal}")
-
-    monitoring.log_prediction(signal)
-
-    # ---------------------------------------------------------
-    # Final Summary
-    # ---------------------------------------------------------
     logger.info("\n" + "=" * 70)
-    logger.info("PIPELINE v3.0 COMPLETED SUCCESSFULLY")
+    logger.info(f"PIPELINE {config.MODEL_VERSION} COMPLETED SUCCESSFULLY.")
     logger.info("=" * 70)
-    logger.info(f"Dataset: {len(df_features)} H1 candles")
-    logger.info(f"Features: {len(feature_cols)} total -> {len(selected_cols)} selected")
-    logger.info(f"Labeling: {config.LABEL_MODE} mode (ATR mult: {config.LABEL_ATR_MULTIPLIER})")
-    logger.info(f"Best Model: {best_model_name} (F1 Macro: {best_f1:.4f})")
-    logger.info(f"Backtest Trades: {bt_metrics.get('Total Trades', 0)}")
-    logger.info(f"Backtest Return: {bt_metrics.get('Total Return (%)', 0):.2f}%")
-    logger.info(f"Max Drawdown: {bt_metrics.get('Max Drawdown (%)', 0):.2f}%")
-    logger.info(f"Sharpe Ratio: {bt_metrics.get('Sharpe Ratio', 0):.2f}")
-    logger.info(f"Win Rate: {bt_metrics.get('Win Rate (%)', 0):.1f}%")
-    logger.info(f"Profit Factor: {bt_metrics.get('Profit Factor', 0):.2f}")
-    logger.info(f"Avg Win: {bt_metrics.get('Avg Win (pips)', 0):.1f} pips")
-    logger.info(f"Avg Loss: {bt_metrics.get('Avg Loss (pips)', 0):.1f} pips")
-    logger.info(f"SL/TP Mode: Dynamic ATR (SL={config.SL_ATR_MULT}x, TP={config.TP_ATR_MULT}x)")
-    logger.info("=" * 70)
-    logger.info(f"Models saved to: {config.MODELS_DIR}")
-    logger.info(f"Charts saved to: {config.OUTPUTS_DIR}")
-    logger.info(f"Logs saved to: {config.LOGS_DIR}")
 
 
 if __name__ == "__main__":

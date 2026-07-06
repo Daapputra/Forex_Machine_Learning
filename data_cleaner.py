@@ -17,7 +17,7 @@ def check_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     """Remove duplicate timestamps, keeping first occurrence."""
     n_dupes = df.index.duplicated().sum()
     if n_dupes > 0:
-        logger.warning(f"Found {n_dupes} duplicate timestamps — dropping duplicates.")
+        logger.warning(f"Found {n_dupes} duplicate timestamps - dropping duplicates.")
         df = df[~df.index.duplicated(keep="first")]
     else:
         logger.info("No duplicate timestamps found.")
